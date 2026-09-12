@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="2.2.0"
+APP_VERSION="2.2.1"
 
 CONFIG="/etc/nft-forward.conf"
 STATE_DIR="/var/lib/nft-forward"
@@ -1708,7 +1708,7 @@ install_self() {
 
     chmod 755 "$INSTALL_PATH"
     write_logrotate_config
-    log_msg "installed/updated binary: $INSTALL_PATH version=$VERSION"
+    log_msg "installed/updated binary: $INSTALL_PATH version=$APP_VERSION"
 }
 
 cron_status() {
@@ -1948,7 +1948,7 @@ status_overview() {
     echo "============================================================"
     echo "                    NFT-FORWARD 当前状态"
     echo "============================================================"
-    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "脚本版本:" "v$APP_VERSION"
     printf "%-18s %s\n" "配置规则数:" "$config_count"
     printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
     printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
@@ -2016,7 +2016,7 @@ menu() {
         clear
 
         echo "================================="
-        echo "      NFT 转发管理脚本 v$VERSION"
+        echo "      NFT 转发管理脚本 v$APP_VERSION"
         echo "================================="
         menu_status_line
         echo "================================="
@@ -2245,7 +2245,7 @@ status_overview() {
     echo "============================================================"
     echo "                    NFT-FORWARD 当前状态"
     echo "============================================================"
-    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "脚本版本:" "v$APP_VERSION"
     printf "%-18s %s\n" "配置规则数:" "$config_count"
     printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
     printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
@@ -2516,7 +2516,7 @@ status_overview() {
     echo "============================================================"
     echo "                    NFT-FORWARD 当前状态"
     echo "============================================================"
-    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "脚本版本:" "v$APP_VERSION"
     printf "%-18s %s\n" "配置规则数:" "$config_count"
     printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
     printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
@@ -2584,7 +2584,7 @@ menu() {
         clear
 
         echo "================================="
-        echo "      NFT 转发管理脚本 v$VERSION"
+        echo "      NFT 转发管理脚本 v$APP_VERSION"
         echo "================================="
         echo "1. 添加转发"
         echo "2. 删除转发"
@@ -2627,7 +2627,7 @@ main() {
 
     # 不应为了查看版本或卸载，反过来要求安装依赖。
     if [ "$action" = "--version" ]; then
-        echo "$VERSION"
+        echo "$APP_VERSION"
         exit 0
     fi
 
