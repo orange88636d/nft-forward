@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 CONFIG="/etc/nft-forward.conf"
 STATE_DIR="/var/lib/nft-forward"
@@ -1856,33 +1856,201 @@ disable_cron_refresh() {
     fi
 }
 
-timer_menu() {
+timer_count_config_rules() {
+    awk -F'|' 'NF >= 5 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$CONFIG" 2>/dev/null
+}
+
+count_state_rules() {
+    awk -F'|' 'NF >= 7 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$STATE_FILE" 2>/dev/null
+}
+
+refresh_scheduler_state() {
+    REFRESH_STATE="关闭"
+    REFRESH_BACKEND="-"
+    REFRESH_DETAIL=""
+
+    if has_systemd && [ -f "$REFRESH_TIMER" ] &&
+       systemctl is-enabled nft-forward-refresh.timer >/dev/null 2>&1; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="systemd timer"
+        REFRESH_DETAIL="$(systemctl show nft-forward-refresh.timer \
+            -p NextElapseUSecRealtime --value --no-pager 2>/dev/null || true)"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$CRON_MARK_BEGIN"; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="cron"
+        REFRESH_DETAIL="$(get_crontab | sed -n "/$CRON_MARK_BEGIN/,/$CRON_MARK_END/p" |
+            grep -v '^#' | head -n1)"
+    fi
+}
+
+boot_restore_state() {
+    BOOT_STATE="关闭"
+    BOOT_BACKEND="-"
+
+    if has_systemd &&
+       [ -f "$SYSTEMD_SERVICE" ] &&
+       systemctl is-enabled nft-forward.service >/dev/null 2>&1; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="systemd"
+        return
+    fi
+
+    if [ -f "$OPENRC_START" ]; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="OpenRC local.d"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$BOOT_CRON_BEGIN"; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="@reboot"
+    fi
+}
+
+nft_runtime_state() {
+    IPV4_TABLE_STATE="未加载"
+    IPV6_TABLE_STATE="未加载"
+
+    nft list table ip "$TABLE" >/dev/null 2>&1 &&
+        IPV4_TABLE_STATE="已加载"
+
+    nft list table ip6 "$TABLE6" >/dev/null 2>&1 &&
+        IPV6_TABLE_STATE="已加载"
+}
+
+last_log_time() {
+    if [ -s "$LOG_FILE" ]; then
+        tail -n1 "$LOG_FILE" 2>/dev/null | awk '{print $1" "$2}'
+    else
+        echo "-"
+    fi
+}
+
+status_overview() {
+    local config_count state_count mode lastlog
+
+    config_count="$(count_config_rules)"
+    state_count="$(count_state_rules)"
+    mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
+    [ -n "$mode" ] || mode="未建立"
+
+    refresh_scheduler_state
+    boot_restore_state
+    nft_runtime_state
+    lastlog="$(last_log_time)"
+
+    echo
+    echo "============================================================"
+    echo "                    NFT-FORWARD 当前状态"
+    echo "============================================================"
+    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "配置规则数:" "$config_count"
+    printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
+    printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
+    printf "%-18s %s\n" "IPv6 nft 表:" "$IPV6_TABLE_STATE"
+
+    case "$mode" in
+        map)
+            printf "%-18s %s\n" "NFT 模式:" "map 增量更新"
+            ;;
+        legacy)
+            printf "%-18s %s\n" "NFT 模式:" "兼容模式"
+            ;;
+        *)
+            printf "%-18s %s\n" "NFT 模式:" "$mode"
+            ;;
+    esac
+
+    printf "%-18s %s" "定时解析:" "$REFRESH_STATE"
+    [ "$REFRESH_STATE" = "开启" ] && printf " (%s)" "$REFRESH_BACKEND"
+    echo
+
+    if [ "$REFRESH_STATE" = "开启" ] && [ -n "$REFRESH_DETAIL" ]; then
+        printf "%-18s %s\n" "定时任务详情:" "$REFRESH_DETAIL"
+    fi
+
+    printf "%-18s %s" "开机自动恢复:" "$BOOT_STATE"
+    [ "$BOOT_STATE" = "开启" ] && printf " (%s)" "$BOOT_BACKEND"
+    echo
+
+    printf "%-18s %s\n" "最后日志时间:" "$lastlog"
+    printf "%-18s %s\n" "配置文件:" "$CONFIG"
+    printf "%-18s %s\n" "日志文件:" "$LOG_FILE"
+
+    if [ "$config_count" -eq "$state_count" ]; then
+        echo -e "一致性:           ${GREEN}正常${NC}"
+    else
+        echo -e "一致性:           ${YELLOW}配置与状态缓存数量不一致${NC}"
+    fi
+
+    if [ "$config_count" -gt 0 ] &&
+       [ "$IPV4_TABLE_STATE" = "未加载" ] &&
+       [ "$IPV6_TABLE_STATE" = "未加载" ]; then
+        echo -e "运行状态:         ${RED}配置存在，但内核 nft 表未加载${NC}"
+    elif [ "$config_count" -eq 0 ]; then
+        echo "运行状态:         暂无转发规则"
+    else
+        echo -e "运行状态:         ${GREEN}已运行${NC}"
+    fi
+
+    echo "============================================================"
+}
+
+menu_status_line() {
+    local config_count
+    config_count="$(count_config_rules)"
+    refresh_scheduler_state
+    boot_restore_state
+
+    printf "规则:%s | 定时解析:%s | 开机恢复:%s\n" \
+        "$config_count" "$REFRESH_STATE" "$BOOT_STATE"
+}
+
+menu() {
     while true; do
         clear
+
         echo "================================="
-        echo "        定时域名解析"
+        echo "      NFT 转发管理脚本 v$VERSION"
         echo "================================="
-        echo -n "状态: "
-        cron_status
-        echo
-        if has_systemd; then
-            echo "调度器: systemd timer"
-        else
-            echo "调度器: cron 兼容模式"
-        fi
-        echo
-        echo "1. 开启/修改定时解析"
-        echo "2. 关闭定时解析"
-        echo "3. 立即检查一次"
-        echo "0. 返回"
+        menu_status_line
         echo "================================="
+        echo "1. 添加转发"
+        echo "2. 删除转发"
+        echo "3. 查看转发"
+        echo "4. 刷新域名 IP"
+        echo "5. 查看 nftables"
+        echo "6. 定时解析域名"
+        echo "7. 开机自动恢复"
+        echo "8. 重新检测环境"
+        echo "9. 安装 / 更新脚本"
+        echo "10. 查看最近日志"
+        echo "11. 卸载脚本"
+        echo "12. 当前状态概览"
+        echo "0. 退出"
+        echo "================================="
+
         read -rp "请选择: " choice
 
         case "$choice" in
-            1) enable_cron_refresh; read -rp "回车继续..." ;;
-            2) disable_cron_refresh; read -rp "回车继续..." ;;
-            3) refresh_dns 1; read -rp "回车继续..." ;;
-            0) return ;;
+            1) add_rule; read -rp "回车继续..." ;;
+            2) delete_rule; read -rp "回车继续..." ;;
+            3) list_rules; read -rp "回车继续..." ;;
+            4) refresh_dns 1; read -rp "回车继续..." ;;
+            5) show_nft; read -rp "回车继续..." ;;
+            6) timer_menu ;;
+            7) boot_menu ;;
+            8) preflight_check; read -rp "回车继续..." ;;
+            9) install_or_update; read -rp "回车继续..." ;;
+            10) show_recent_log; read -rp "回车继续..." ;;
+            11) uninstall_script; read -rp "回车继续..." ;;
+            12) status_overview; read -rp "回车继续..." ;;
+            0) exit 0 ;;
             *) echo "输入错误"; sleep 1 ;;
         esac
     done
@@ -1985,7 +2153,162 @@ disable_boot_restore() {
     echo -e "${GREEN}开机自动恢复已关闭${NC}"
 }
 
-boot_menu() {
+boot_count_config_rules() {
+    awk -F'|' 'NF >= 5 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$CONFIG" 2>/dev/null
+}
+
+count_state_rules() {
+    awk -F'|' 'NF >= 7 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$STATE_FILE" 2>/dev/null
+}
+
+refresh_scheduler_state() {
+    REFRESH_STATE="关闭"
+    REFRESH_BACKEND="-"
+    REFRESH_DETAIL=""
+
+    if has_systemd && [ -f "$REFRESH_TIMER" ] &&
+       systemctl is-enabled nft-forward-refresh.timer >/dev/null 2>&1; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="systemd timer"
+        REFRESH_DETAIL="$(systemctl show nft-forward-refresh.timer \
+            -p NextElapseUSecRealtime --value --no-pager 2>/dev/null || true)"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$CRON_MARK_BEGIN"; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="cron"
+        REFRESH_DETAIL="$(get_crontab | sed -n "/$CRON_MARK_BEGIN/,/$CRON_MARK_END/p" |
+            grep -v '^#' | head -n1)"
+    fi
+}
+
+boot_restore_state() {
+    BOOT_STATE="关闭"
+    BOOT_BACKEND="-"
+
+    if has_systemd &&
+       [ -f "$SYSTEMD_SERVICE" ] &&
+       systemctl is-enabled nft-forward.service >/dev/null 2>&1; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="systemd"
+        return
+    fi
+
+    if [ -f "$OPENRC_START" ]; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="OpenRC local.d"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$BOOT_CRON_BEGIN"; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="@reboot"
+    fi
+}
+
+nft_runtime_state() {
+    IPV4_TABLE_STATE="未加载"
+    IPV6_TABLE_STATE="未加载"
+
+    nft list table ip "$TABLE" >/dev/null 2>&1 &&
+        IPV4_TABLE_STATE="已加载"
+
+    nft list table ip6 "$TABLE6" >/dev/null 2>&1 &&
+        IPV6_TABLE_STATE="已加载"
+}
+
+last_log_time() {
+    if [ -s "$LOG_FILE" ]; then
+        tail -n1 "$LOG_FILE" 2>/dev/null | awk '{print $1" "$2}'
+    else
+        echo "-"
+    fi
+}
+
+status_overview() {
+    local config_count state_count mode lastlog
+
+    config_count="$(count_config_rules)"
+    state_count="$(count_state_rules)"
+    mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
+    [ -n "$mode" ] || mode="未建立"
+
+    refresh_scheduler_state
+    boot_restore_state
+    nft_runtime_state
+    lastlog="$(last_log_time)"
+
+    echo
+    echo "============================================================"
+    echo "                    NFT-FORWARD 当前状态"
+    echo "============================================================"
+    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "配置规则数:" "$config_count"
+    printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
+    printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
+    printf "%-18s %s\n" "IPv6 nft 表:" "$IPV6_TABLE_STATE"
+
+    case "$mode" in
+        map)
+            printf "%-18s %s\n" "NFT 模式:" "map 增量更新"
+            ;;
+        legacy)
+            printf "%-18s %s\n" "NFT 模式:" "兼容模式"
+            ;;
+        *)
+            printf "%-18s %s\n" "NFT 模式:" "$mode"
+            ;;
+    esac
+
+    printf "%-18s %s" "定时解析:" "$REFRESH_STATE"
+    [ "$REFRESH_STATE" = "开启" ] && printf " (%s)" "$REFRESH_BACKEND"
+    echo
+
+    if [ "$REFRESH_STATE" = "开启" ] && [ -n "$REFRESH_DETAIL" ]; then
+        printf "%-18s %s\n" "定时任务详情:" "$REFRESH_DETAIL"
+    fi
+
+    printf "%-18s %s" "开机自动恢复:" "$BOOT_STATE"
+    [ "$BOOT_STATE" = "开启" ] && printf " (%s)" "$BOOT_BACKEND"
+    echo
+
+    printf "%-18s %s\n" "最后日志时间:" "$lastlog"
+    printf "%-18s %s\n" "配置文件:" "$CONFIG"
+    printf "%-18s %s\n" "日志文件:" "$LOG_FILE"
+
+    if [ "$config_count" -eq "$state_count" ]; then
+        echo -e "一致性:           ${GREEN}正常${NC}"
+    else
+        echo -e "一致性:           ${YELLOW}配置与状态缓存数量不一致${NC}"
+    fi
+
+    if [ "$config_count" -gt 0 ] &&
+       [ "$IPV4_TABLE_STATE" = "未加载" ] &&
+       [ "$IPV6_TABLE_STATE" = "未加载" ]; then
+        echo -e "运行状态:         ${RED}配置存在，但内核 nft 表未加载${NC}"
+    elif [ "$config_count" -eq 0 ]; then
+        echo "运行状态:         暂无转发规则"
+    else
+        echo -e "运行状态:         ${GREEN}已运行${NC}"
+    fi
+
+    echo "============================================================"
+}
+
+menu_status_line() {
+    local config_count
+    config_count="$(count_config_rules)"
+    refresh_scheduler_state
+    boot_restore_state
+
+    printf "规则:%s | 定时解析:%s | 开机恢复:%s\n" \
+        "$config_count" "$REFRESH_STATE" "$BOOT_STATE"
+}
+
+menu() {
     while true; do
         clear
         echo "================================="
@@ -2101,6 +2424,161 @@ ensure_runtime_rules() {
     fi
 }
 
+count_config_rules() {
+    awk -F'|' 'NF >= 5 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$CONFIG" 2>/dev/null
+}
+
+count_state_rules() {
+    awk -F'|' 'NF >= 7 && $1 ~ /^[0-9]+$/ {count++} END {print count+0}' "$STATE_FILE" 2>/dev/null
+}
+
+refresh_scheduler_state() {
+    REFRESH_STATE="关闭"
+    REFRESH_BACKEND="-"
+    REFRESH_DETAIL=""
+
+    if has_systemd && [ -f "$REFRESH_TIMER" ] &&
+       systemctl is-enabled nft-forward-refresh.timer >/dev/null 2>&1; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="systemd timer"
+        REFRESH_DETAIL="$(systemctl show nft-forward-refresh.timer \
+            -p NextElapseUSecRealtime --value --no-pager 2>/dev/null || true)"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$CRON_MARK_BEGIN"; then
+        REFRESH_STATE="开启"
+        REFRESH_BACKEND="cron"
+        REFRESH_DETAIL="$(get_crontab | sed -n "/$CRON_MARK_BEGIN/,/$CRON_MARK_END/p" |
+            grep -v '^#' | head -n1)"
+    fi
+}
+
+boot_restore_state() {
+    BOOT_STATE="关闭"
+    BOOT_BACKEND="-"
+
+    if has_systemd &&
+       [ -f "$SYSTEMD_SERVICE" ] &&
+       systemctl is-enabled nft-forward.service >/dev/null 2>&1; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="systemd"
+        return
+    fi
+
+    if [ -f "$OPENRC_START" ]; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="OpenRC local.d"
+        return
+    fi
+
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$BOOT_CRON_BEGIN"; then
+        BOOT_STATE="开启"
+        BOOT_BACKEND="@reboot"
+    fi
+}
+
+nft_runtime_state() {
+    IPV4_TABLE_STATE="未加载"
+    IPV6_TABLE_STATE="未加载"
+
+    nft list table ip "$TABLE" >/dev/null 2>&1 &&
+        IPV4_TABLE_STATE="已加载"
+
+    nft list table ip6 "$TABLE6" >/dev/null 2>&1 &&
+        IPV6_TABLE_STATE="已加载"
+}
+
+last_log_time() {
+    if [ -s "$LOG_FILE" ]; then
+        tail -n1 "$LOG_FILE" 2>/dev/null | awk '{print $1" "$2}'
+    else
+        echo "-"
+    fi
+}
+
+status_overview() {
+    local config_count state_count mode lastlog
+
+    config_count="$(count_config_rules)"
+    state_count="$(count_state_rules)"
+    mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
+    [ -n "$mode" ] || mode="未建立"
+
+    refresh_scheduler_state
+    boot_restore_state
+    nft_runtime_state
+    lastlog="$(last_log_time)"
+
+    echo
+    echo "============================================================"
+    echo "                    NFT-FORWARD 当前状态"
+    echo "============================================================"
+    printf "%-18s %s\n" "脚本版本:" "v$VERSION"
+    printf "%-18s %s\n" "配置规则数:" "$config_count"
+    printf "%-18s %s\n" "状态缓存规则数:" "$state_count"
+    printf "%-18s %s\n" "IPv4 nft 表:" "$IPV4_TABLE_STATE"
+    printf "%-18s %s\n" "IPv6 nft 表:" "$IPV6_TABLE_STATE"
+
+    case "$mode" in
+        map)
+            printf "%-18s %s\n" "NFT 模式:" "map 增量更新"
+            ;;
+        legacy)
+            printf "%-18s %s\n" "NFT 模式:" "兼容模式"
+            ;;
+        *)
+            printf "%-18s %s\n" "NFT 模式:" "$mode"
+            ;;
+    esac
+
+    printf "%-18s %s" "定时解析:" "$REFRESH_STATE"
+    [ "$REFRESH_STATE" = "开启" ] && printf " (%s)" "$REFRESH_BACKEND"
+    echo
+
+    if [ "$REFRESH_STATE" = "开启" ] && [ -n "$REFRESH_DETAIL" ]; then
+        printf "%-18s %s\n" "定时任务详情:" "$REFRESH_DETAIL"
+    fi
+
+    printf "%-18s %s" "开机自动恢复:" "$BOOT_STATE"
+    [ "$BOOT_STATE" = "开启" ] && printf " (%s)" "$BOOT_BACKEND"
+    echo
+
+    printf "%-18s %s\n" "最后日志时间:" "$lastlog"
+    printf "%-18s %s\n" "配置文件:" "$CONFIG"
+    printf "%-18s %s\n" "日志文件:" "$LOG_FILE"
+
+    if [ "$config_count" -eq "$state_count" ]; then
+        echo -e "一致性:           ${GREEN}正常${NC}"
+    else
+        echo -e "一致性:           ${YELLOW}配置与状态缓存数量不一致${NC}"
+    fi
+
+    if [ "$config_count" -gt 0 ] &&
+       [ "$IPV4_TABLE_STATE" = "未加载" ] &&
+       [ "$IPV6_TABLE_STATE" = "未加载" ]; then
+        echo -e "运行状态:         ${RED}配置存在，但内核 nft 表未加载${NC}"
+    elif [ "$config_count" -eq 0 ]; then
+        echo "运行状态:         暂无转发规则"
+    else
+        echo -e "运行状态:         ${GREEN}已运行${NC}"
+    fi
+
+    echo "============================================================"
+}
+
+menu_status_line() {
+    local config_count
+    config_count="$(count_config_rules)"
+    refresh_scheduler_state
+    boot_restore_state
+
+    printf "规则:%s | 定时解析:%s | 开机恢复:%s\n" \
+        "$config_count" "$REFRESH_STATE" "$BOOT_STATE"
+}
+
 menu() {
     while true; do
         clear
@@ -2153,6 +2631,13 @@ main() {
         exit 0
     fi
 
+    if [ "$action" = "--status" ]; then
+        [ "$(id -u)" -eq 0 ] || die "请使用 root 查看完整状态"
+        ensure_data_files
+        status_overview
+        exit 0
+    fi
+
     if [ "$action" = "--uninstall" ]; then
         [ "$(id -u)" -eq 0 ] || die "请使用 root 运行卸载"
         ensure_data_files
@@ -2195,7 +2680,7 @@ main() {
             menu
             ;;
         *)
-            echo "用法: $0 [--refresh|--restore|--install|--uninstall|--version]"
+            echo "用法: $0 [--refresh|--restore|--install|--uninstall|--status|--version]"
             exit 1
             ;;
     esac
