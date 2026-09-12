@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-APP_VERSION="2.2.1"
+APP_VERSION="2.2.2"
 
 CONFIG="/etc/nft-forward.conf"
 STATE_DIR="/var/lib/nft-forward"
@@ -117,11 +117,22 @@ die() {
 }
 
 detect_os() {
+    OS_ID="unknown"
+    OS_NAME="Unknown Linux"
+    PKG_MANAGER=""
+    CRON_SERVICE=""
+
     if [ -f /etc/os-release ]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_NAME="${PRETTY_NAME:-${NAME:-Unknown Linux}}"
+        OS_ID="$(awk -F= '$1=="ID" {gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release)"
+        OS_NAME="$(awk -F= '$1=="PRETTY_NAME" {
+            sub(/^[^=]*=/, "");
+            gsub(/^"|"$/, "");
+            print;
+            exit
+        }' /etc/os-release)"
+
+        [ -n "$OS_ID" ] || OS_ID="unknown"
+        [ -n "$OS_NAME" ] || OS_NAME="Unknown Linux"
     fi
 
     case "$OS_ID" in
@@ -2028,7 +2039,7 @@ menu() {
         echo "6. 定时解析域名"
         echo "7. 开机自动恢复"
         echo "8. 重新检测环境"
-        echo "9. 安装 / 更新脚本"
+        echo "9. 安装当前脚本到系统"
         echo "10. 查看最近日志"
         echo "11. 卸载脚本"
         echo "12. 当前状态概览"
@@ -2351,6 +2362,7 @@ install_or_update() {
 
     echo
     echo -e "${GREEN}安装/更新完成${NC}"
+    echo "来源: $SCRIPT_PATH"
     echo "命令: $INSTALL_PATH"
     echo "配置: $CONFIG"
     echo "状态: $STATE_FILE"
@@ -2594,7 +2606,7 @@ menu() {
         echo "6. 定时解析域名"
         echo "7. 开机自动恢复"
         echo "8. 重新检测环境"
-        echo "9. 安装 / 更新脚本"
+        echo "9. 安装当前脚本到系统"
         echo "10. 查看最近日志"
         echo "11. 卸载脚本"
         echo "0. 退出"
