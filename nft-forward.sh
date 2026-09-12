@@ -7,6 +7,8 @@ TABLE6="nft_forward6"
 CRON_MARK_BEGIN="# BEGIN NFT-FORWARD"
 CRON_MARK_END="# END NFT-FORWARD"
 DEFAULT_INTERVAL=5
+DNS_TIMEOUT=5
+FALLBACK_DNS="1.1.1.1"
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -166,7 +168,18 @@ preflight_check() {
         echo -e "[${YELLOW}警告${NC}] 未发现 sysctl"
     fi
 
-    if [ "$need_nft" -eq 0 ] && [ "$need_cron" -eq 0 ] && [ "$need_dns" -eq 0 ]; then
+    if command -v timeout >/dev/null 2>&1; then
+        echo -e "[${GREEN}OK${NC}] timeout"
+    else
+        echo -e "[${RED}缺少${NC}] timeout（DNS 防卡死需要）"
+        case "$PKG_MANAGER" in
+            apt|dnf|yum) missing+=("coreutils") ;;
+            apk) missing+=("coreutils") ;;
+            pacman) missing+=("coreutils") ;;
+        esac
+    fi
+
+    if [ "$need_nft" -eq 0 ] && [ "$need_cron" -eq 0 ] && [ "$need_dns" -eq 0 ] && command -v timeout >/dev/null 2>&1; then
         echo
         echo -e "${GREEN}环境检测通过${NC}"
         sleep 1
@@ -219,6 +232,7 @@ preflight_check() {
     ensure_cron_service
 
     command -v nft >/dev/null 2>&1 || die "nftables 安装后仍不可用"
+    command -v timeout >/dev/null 2>&1 || die "timeout 安装后仍不可用"
     if ! command -v getent >/dev/null 2>&1 && \
        ! command -v nslookup >/dev/null 2>&1 && \
        ! command -v host >/dev/null 2>&1; then
@@ -340,22 +354,41 @@ resolve_ipv4_name() {
     local host="$1"
     local ip=""
 
+    # 1) 先走系统 DNS，但最多等待 DNS_TIMEOUT 秒。
     if command -v getent >/dev/null 2>&1; then
-        ip="$(getent ahostsv4 "$host" 2>/dev/null \
+        ip="$(timeout "$DNS_TIMEOUT" getent ahostsv4 "$host" 2>/dev/null \
             | awk '{print $1}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
             | head -n1)"
     fi
 
     if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
-        ip="$(host -t A "$host" 2>/dev/null | awk '/has address/ {print $4; exit}')"
+        ip="$(timeout "$DNS_TIMEOUT" host -t A "$host" 2>/dev/null \
+            | awk '/has address/ {print $4; exit}')"
     fi
 
     if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
-        ip="$(nslookup -query=A "$host" 2>/dev/null \
+        ip="$(timeout "$DNS_TIMEOUT" nslookup -query=A "$host" 2>/dev/null \
             | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
             | tail -n1)"
+    fi
+
+    # 2) 系统 DNS 卡住/失败时，直接向 1.1.1.1 查询。
+    if [ -z "$ip" ]; then
+        echo -e "${YELLOW}系统 DNS 超时/失败，改用 ${FALLBACK_DNS} 查询 IPv4...${NC}" >&2
+
+        if command -v host >/dev/null 2>&1; then
+            ip="$(timeout "$DNS_TIMEOUT" host -t A "$host" "$FALLBACK_DNS" 2>/dev/null \
+                | awk '/has address/ {print $4; exit}')"
+        fi
+
+        if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+            ip="$(timeout "$DNS_TIMEOUT" nslookup -query=A "$host" "$FALLBACK_DNS" 2>/dev/null \
+                | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+                | tail -n1)"
+        fi
     fi
 
     valid_ipv4 "$ip" 2>/dev/null && printf '%s' "$ip"
@@ -365,22 +398,41 @@ resolve_ipv6_name() {
     local host="$1"
     local ip=""
 
+    # 1) 先走系统 DNS，但最多等待 DNS_TIMEOUT 秒。
     if command -v getent >/dev/null 2>&1; then
-        ip="$(getent ahostsv6 "$host" 2>/dev/null \
+        ip="$(timeout "$DNS_TIMEOUT" getent ahostsv6 "$host" 2>/dev/null \
             | awk '{print $1}' \
             | grep ':' \
             | head -n1)"
     fi
 
     if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
-        ip="$(host -t AAAA "$host" 2>/dev/null | awk '/has IPv6 address/ {print $5; exit}')"
+        ip="$(timeout "$DNS_TIMEOUT" host -t AAAA "$host" 2>/dev/null \
+            | awk '/has IPv6 address/ {print $5; exit}')"
     fi
 
     if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
-        ip="$(nslookup -query=AAAA "$host" 2>/dev/null \
+        ip="$(timeout "$DNS_TIMEOUT" nslookup -query=AAAA "$host" 2>/dev/null \
             | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
             | grep ':' \
             | tail -n1)"
+    fi
+
+    # 2) 系统 DNS 卡住/失败时，直接向 1.1.1.1 查询。
+    if [ -z "$ip" ]; then
+        echo -e "${YELLOW}系统 DNS 超时/失败，改用 ${FALLBACK_DNS} 查询 IPv6...${NC}" >&2
+
+        if command -v host >/dev/null 2>&1; then
+            ip="$(timeout "$DNS_TIMEOUT" host -t AAAA "$host" "$FALLBACK_DNS" 2>/dev/null \
+                | awk '/has IPv6 address/ {print $5; exit}')"
+        fi
+
+        if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+            ip="$(timeout "$DNS_TIMEOUT" nslookup -query=AAAA "$host" "$FALLBACK_DNS" 2>/dev/null \
+                | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
+                | grep ':' \
+                | tail -n1)"
+        fi
     fi
 
     valid_ipv6 "$ip" 2>/dev/null && printf '%s' "$ip"
