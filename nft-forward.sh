@@ -61,17 +61,17 @@ reload_rules() {
     nft add table ip "$TABLE"
 
     nft "add chain ip $TABLE prerouting {
-        type nat hook prerouting priority dstnat;
+        type nat hook prerouting priority -100;
         policy accept;
     }"
 
     nft "add chain ip $TABLE output {
-        type nat hook output priority dstnat;
+        type nat hook output priority -100;
         policy accept;
     }"
 
     nft "add chain ip $TABLE postrouting {
-        type nat hook postrouting priority srcnat;
+        type nat hook postrouting priority 100;
         policy accept;
     }"
 
