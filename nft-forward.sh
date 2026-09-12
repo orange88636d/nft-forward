@@ -3,6 +3,7 @@ set -u
 
 CONFIG="/etc/nft-forward.conf"
 TABLE="nft_forward"
+TABLE6="nft_forward6"
 CRON_MARK_BEGIN="# BEGIN NFT-FORWARD"
 CRON_MARK_END="# END NFT-FORWARD"
 DEFAULT_INTERVAL=5
@@ -232,36 +233,228 @@ preflight_check() {
 enable_forwarding() {
     if command -v sysctl >/dev/null 2>&1; then
         sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    elif [ -w /proc/sys/net/ipv4/ip_forward ]; then
-        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    else
+        [ -w /proc/sys/net/ipv4/ip_forward ] && \
+            echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+        [ -w /proc/sys/net/ipv6/conf/all/forwarding ] && \
+            echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
     fi
 }
 
-resolve_domain() {
-    local host="$1"
-    local ip=""
+trim_target() {
+    local value="$1"
 
-    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        echo "$host"
+    # 去除首尾空白
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
+    # 用户可以输入 [2001:db8::1]，内部统一保存为裸 IPv6
+    if [[ "$value" == \[*\] ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+
+    printf '%s' "$value"
+}
+
+valid_ipv4() {
+    local ip="$1"
+    local a b c d extra
+
+    IFS='.' read -r a b c d extra <<< "$ip"
+
+    [ -z "${extra:-}" ] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
+valid_ipv6() {
+    local ip="$1"
+
+    # 先做字符级防御，禁止 zone id、CIDR、空格和命令字符。
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+
+    # 使用 nft 自身解析器做最终语法校验，避免用不完整的 IPv6 正则。
+    printf 'table ip6 __nftfw_validate { chain prerouting { type nat hook prerouting priority -100; tcp dport 1 dnat to [%s]:1; } }\n' "$ip" \
+        | nft -c -f - >/dev/null 2>&1
+}
+
+valid_domain() {
+    local domain="$1"
+    local label
+
+    [ -n "$domain" ] || return 1
+    [ "${#domain}" -le 253 ] || return 1
+
+    # 只允许普通 ASCII/Punycode 主机名字符；拒绝 | ; $ 空格 / 等注入字符。
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+\.?$ ]] || return 1
+
+    # 纯数字或纯数字+点不能当域名绕过 IP 校验，例如 5555 / 999.1。
+    [[ "$domain" =~ [A-Za-z-] ]] || return 1
+
+    domain="${domain%.}"
+    [[ "$domain" == *.* ]] || return 1
+    [[ "$domain" != .* && "$domain" != *. && "$domain" != *..* ]] || return 1
+
+    IFS='.' read -ra labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] || return 1
+        [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+safe_target_ip() {
+    local family="$1"
+    local ip="$2"
+
+    if [ "$family" = "4" ]; then
+        # 未指定 / 广播 / 组播不应作为 DNAT 目标。
+        [ "$ip" != "0.0.0.0" ] || return 1
+        [ "$ip" != "255.255.255.255" ] || return 1
+
+        local first="${ip%%.*}"
+        [ "$first" -ge 224 ] && [ "$first" -le 239 ] && return 1
+
         return 0
     fi
 
-    if command -v getent >/dev/null 2>&1; then
-        ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -n1)"
+    local lower="${ip,,}"
+
+    # IPv6 未指定、组播以及需要 scope-id 的 link-local 地址禁止作为转发目标。
+    [ "$lower" != "::" ] || return 1
+    [[ "$lower" != ff* ]] || return 1
+
+    # fe80::/10 => fe8x、fe9x、feax、febx
+    if [[ "$lower" =~ ^fe[89abAB] ]]; then
+        return 1
     fi
 
-    if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
-        ip="$(nslookup "$host" 2>/dev/null | awk '
-            /^Address: / { print $2 }
-            /^Address [0-9]+: / { print $3 }
-        ' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
+    return 0
+}
+
+resolve_ipv4_name() {
+    local host="$1"
+    local ip=""
+
+    if command -v getent >/dev/null 2>&1; then
+        ip="$(getent ahostsv4 "$host" 2>/dev/null \
+            | awk '{print $1}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -n1)"
     fi
 
     if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
         ip="$(host -t A "$host" 2>/dev/null | awk '/has address/ {print $4; exit}')"
     fi
 
-    [ -n "$ip" ] && echo "$ip"
+    if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+        ip="$(nslookup -query=A "$host" 2>/dev/null \
+            | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+            | tail -n1)"
+    fi
+
+    valid_ipv4 "$ip" 2>/dev/null && printf '%s' "$ip"
+}
+
+resolve_ipv6_name() {
+    local host="$1"
+    local ip=""
+
+    if command -v getent >/dev/null 2>&1; then
+        ip="$(getent ahostsv6 "$host" 2>/dev/null \
+            | awk '{print $1}' \
+            | grep ':' \
+            | head -n1)"
+    fi
+
+    if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
+        ip="$(host -t AAAA "$host" 2>/dev/null | awk '/has IPv6 address/ {print $5; exit}')"
+    fi
+
+    if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+        ip="$(nslookup -query=AAAA "$host" 2>/dev/null \
+            | awk '/^Address: / {print $2} /^Address [0-9]+: / {print $3}' \
+            | grep ':' \
+            | tail -n1)"
+    fi
+
+    valid_ipv6 "$ip" 2>/dev/null && printf '%s' "$ip"
+}
+
+validate_target_format() {
+    local host="$1"
+
+    [ -n "$host" ] || return 1
+
+    # 配置字段分隔符和常见 shell/路径字符一律拒绝。
+    [[ "$host" != *"|"* && "$host" != *"/"* && "$host" != *"\\"* &&
+       "$host" != *";"* && "$host" != *'$'* && "$host" != *'`'* &&
+       "$host" != *" "* && "$host" != *$'\t'* && "$host" != *$'\n'* ]] || return 1
+
+    if [[ "$host" == *:* ]]; then
+        valid_ipv6 "$host"
+        return
+    fi
+
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        valid_ipv4 "$host"
+        return
+    fi
+
+    valid_domain "$host"
+}
+
+resolve_target() {
+    local host="$1"
+    local ip=""
+
+    TARGET_FAMILY=""
+    TARGET_IP=""
+    TARGET_KIND=""
+
+    if ! validate_target_format "$host"; then
+        return 2
+    fi
+
+    if valid_ipv4 "$host" 2>/dev/null; then
+        safe_target_ip 4 "$host" || return 3
+        TARGET_FAMILY="4"
+        TARGET_IP="$host"
+        TARGET_KIND="IPv4"
+        return 0
+    fi
+
+    if [[ "$host" == *:* ]] && valid_ipv6 "$host" 2>/dev/null; then
+        safe_target_ip 6 "$host" || return 3
+        TARGET_FAMILY="6"
+        TARGET_IP="$host"
+        TARGET_KIND="IPv6"
+        return 0
+    fi
+
+    # 域名默认优先 A 记录，保持原有 IPv4 行为；没有 A 再使用 AAAA。
+    ip="$(resolve_ipv4_name "$host")"
+    if [ -n "$ip" ] && safe_target_ip 4 "$ip"; then
+        TARGET_FAMILY="4"
+        TARGET_IP="$ip"
+        TARGET_KIND="域名/IPv4"
+        return 0
+    fi
+
+    ip="$(resolve_ipv6_name "$host")"
+    if [ -n "$ip" ] && safe_target_ip 6 "$ip"; then
+        TARGET_FAMILY="6"
+        TARGET_IP="$ip"
+        TARGET_KIND="域名/IPv6"
+        return 0
+    fi
+
+    return 1
 }
 
 valid_port() {
@@ -284,23 +477,23 @@ reload_rules() {
     echo "================================="
 
     nft delete table ip "$TABLE" 2>/dev/null || true
-    nft add table ip "$TABLE"
+    nft delete table ip6 "$TABLE6" 2>/dev/null || true
 
+    nft add table ip "$TABLE"
     nft "add chain ip $TABLE prerouting {
         type nat hook prerouting priority -100;
         policy accept;
     }"
-
     nft "add chain ip $TABLE output {
         type nat hook output priority -100;
         policy accept;
     }"
-
     nft "add chain ip $TABLE postrouting {
         type nat hook postrouting priority 100;
         policy accept;
     }"
 
+    local ip6_ready=0
     local total=0
     local success=0
     local failed=0
@@ -313,66 +506,136 @@ reload_rules() {
         [ -z "${id:-}" ] && continue
         total=$((total + 1))
 
+        # 对旧配置也重新做防御性校验，不能因为写进配置文件就默认可信。
+        host="$(trim_target "$host")"
+
         echo
         echo "ID=$id  $proto :$listen_port -> $host:$target_port"
-        echo -n "解析域名: $host ... "
+        echo -n "目标检测: $host ... "
 
-        local_ip="$(resolve_domain "$host")"
+        resolve_target "$host"
+        rc=$?
 
-        if [ -z "$local_ip" ]; then
+        if [ "$rc" -eq 2 ]; then
             echo -e "${RED}失败${NC}"
-            echo -e "结果: ${RED}无法获取 IPv4 地址${NC}"
+            echo -e "结果: ${RED}不是合法 IPv4、IPv6 或域名${NC}"
+            failed=$((failed + 1))
+            continue
+        elif [ "$rc" -eq 3 ]; then
+            echo -e "${RED}拒绝${NC}"
+            echo -e "结果: ${RED}目标属于未指定/广播/组播/link-local 等防御性禁止地址${NC}"
+            failed=$((failed + 1))
+            continue
+        elif [ "$rc" -ne 0 ]; then
+            echo -e "${RED}失败${NC}"
+            echo -e "结果: ${RED}域名无法解析出可用 A/AAAA 地址${NC}"
             failed=$((failed + 1))
             continue
         fi
 
         echo -e "${GREEN}成功${NC}"
-        echo -e "结果: ${CYAN}$host -> $local_ip${NC}"
+        echo -e "类型: ${CYAN}${TARGET_KIND}${NC}"
+        echo -e "结果: ${CYAN}$host -> $TARGET_IP${NC}"
 
-        case "$proto" in
-            tcp)
-                nft add rule ip "$TABLE" prerouting \
-                    tcp dport "$listen_port" dnat to "$local_ip:$target_port"
+        if [ "$TARGET_FAMILY" = "4" ]; then
+            nft_target="${TARGET_IP}:${target_port}"
+            echo -e "NFT 目标: ${CYAN}${nft_target}${NC}"
 
-                nft add rule ip "$TABLE" output \
-                    ip daddr type local tcp dport "$listen_port" \
-                    dnat to "$local_ip:$target_port"
-                ;;
-            udp)
-                nft add rule ip "$TABLE" prerouting \
-                    udp dport "$listen_port" dnat to "$local_ip:$target_port"
+            case "$proto" in
+                tcp)
+                    nft add rule ip "$TABLE" prerouting \
+                        tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip "$TABLE" output \
+                        fib daddr type local tcp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                udp)
+                    nft add rule ip "$TABLE" prerouting \
+                        udp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip "$TABLE" output \
+                        fib daddr type local udp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                both)
+                    nft add rule ip "$TABLE" prerouting \
+                        tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip "$TABLE" prerouting \
+                        udp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip "$TABLE" output \
+                        fib daddr type local tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip "$TABLE" output \
+                        fib daddr type local udp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                *)
+                    echo -e "${RED}协议无效: $proto${NC}"
+                    failed=$((failed + 1))
+                    continue
+                    ;;
+            esac
+        else
+            if [ "$ip6_ready" -eq 0 ]; then
+                if ! nft add table ip6 "$TABLE6" 2>/dev/null; then
+                    echo -e "${RED}无法创建 IPv6 NAT 表，当前系统可能未启用 IPv6 nftables${NC}"
+                    failed=$((failed + 1))
+                    continue
+                fi
 
-                nft add rule ip "$TABLE" output \
-                    ip daddr type local udp dport "$listen_port" \
-                    dnat to "$local_ip:$target_port"
-                ;;
-            both)
-                nft add rule ip "$TABLE" prerouting \
-                    tcp dport "$listen_port" dnat to "$local_ip:$target_port"
+                nft "add chain ip6 $TABLE6 prerouting {
+                    type nat hook prerouting priority -100;
+                    policy accept;
+                }"
+                nft "add chain ip6 $TABLE6 output {
+                    type nat hook output priority -100;
+                    policy accept;
+                }"
+                nft "add chain ip6 $TABLE6 postrouting {
+                    type nat hook postrouting priority 100;
+                    policy accept;
+                }"
+                ip6_ready=1
+            fi
 
-                nft add rule ip "$TABLE" prerouting \
-                    udp dport "$listen_port" dnat to "$local_ip:$target_port"
+            # IPv6 + port 必须使用 [IPv6]:port，防止冒号歧义。
+            nft_target="[${TARGET_IP}]:${target_port}"
+            echo -e "NFT 目标: ${CYAN}${nft_target}${NC}"
 
-                nft add rule ip "$TABLE" output \
-                    ip daddr type local tcp dport "$listen_port" \
-                    dnat to "$local_ip:$target_port"
-
-                nft add rule ip "$TABLE" output \
-                    ip daddr type local udp dport "$listen_port" \
-                    dnat to "$local_ip:$target_port"
-                ;;
-            *)
-                echo -e "${RED}协议无效: $proto${NC}"
-                failed=$((failed + 1))
-                continue
-                ;;
-        esac
+            case "$proto" in
+                tcp)
+                    nft add rule ip6 "$TABLE6" prerouting \
+                        tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip6 "$TABLE6" output \
+                        fib daddr type local tcp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                udp)
+                    nft add rule ip6 "$TABLE6" prerouting \
+                        udp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip6 "$TABLE6" output \
+                        fib daddr type local udp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                both)
+                    nft add rule ip6 "$TABLE6" prerouting \
+                        tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip6 "$TABLE6" prerouting \
+                        udp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip6 "$TABLE6" output \
+                        fib daddr type local tcp dport "$listen_port" dnat to "$nft_target"
+                    nft add rule ip6 "$TABLE6" output \
+                        fib daddr type local udp dport "$listen_port" dnat to "$nft_target"
+                    ;;
+                *)
+                    echo -e "${RED}协议无效: $proto${NC}"
+                    failed=$((failed + 1))
+                    continue
+                    ;;
+            esac
+        fi
 
         success=$((success + 1))
         echo -e "NFT 规则: ${GREEN}已加载${NC}"
     done < "$CONFIG"
 
     nft add rule ip "$TABLE" postrouting masquerade
+    if [ "$ip6_ready" -eq 1 ]; then
+        nft add rule ip6 "$TABLE6" postrouting masquerade
+    fi
 
     echo
     echo "================================="
@@ -386,7 +649,7 @@ reload_rules() {
 add_rule() {
     echo
     read -rp "本机监听端口: " listen_port
-    valid_port "$listen_port" || { echo -e "${RED}端口无效${NC}"; return; }
+    valid_port "$listen_port" || { echo -e "${RED}端口无效，只允许 1-65535${NC}"; return; }
 
     echo
     echo "协议:"
@@ -403,21 +666,49 @@ add_rule() {
     esac
 
     read -rp "目标域名/IP: " host
+    host="$(trim_target "$host")"
+
+    echo -n "目标检测: $host ... "
+    resolve_target "$host"
+    rc=$?
+
+    case "$rc" in
+        0)
+            echo -e "${GREEN}成功${NC}"
+            echo -e "类型: ${CYAN}${TARGET_KIND}${NC}"
+            echo -e "解析: ${CYAN}$host -> $TARGET_IP${NC}"
+            ;;
+        2)
+            echo -e "${RED}失败${NC}"
+            echo -e "${RED}请输入合法 IPv4、IPv6 或完整域名。像 5555 这样的值会被拒绝。${NC}"
+            return
+            ;;
+        3)
+            echo -e "${RED}拒绝${NC}"
+            echo -e "${RED}该地址属于未指定/广播/组播/link-local 等不安全转发目标。${NC}"
+            return
+            ;;
+        *)
+            echo -e "${RED}失败${NC}"
+            echo -e "${RED}域名无法解析出可用的 A/AAAA 地址。${NC}"
+            return
+            ;;
+    esac
+
     read -rp "目标端口: " target_port
-    valid_port "$target_port" || { echo -e "${RED}目标端口无效${NC}"; return; }
+    valid_port "$target_port" || { echo -e "${RED}目标端口无效，只允许 1-65535${NC}"; return; }
 
-    echo
-    echo -n "解析域名: $host ... "
-    ip="$(resolve_domain "$host")"
-
-    if [ -z "$ip" ]; then
-        echo -e "${RED}失败${NC}"
-        echo -e "结果: ${RED}无法获取 IPv4 地址${NC}"
-        return
+    if [ "$TARGET_FAMILY" = "6" ]; then
+        echo -e "NFT 目标将使用: ${CYAN}[${TARGET_IP}]:${target_port}${NC}"
+    else
+        echo -e "NFT 目标将使用: ${CYAN}${TARGET_IP}:${target_port}${NC}"
     fi
 
-    echo -e "${GREEN}成功${NC}"
-    echo -e "结果: ${CYAN}$host -> $ip${NC}"
+    # 拒绝完全相同的重复配置，避免重复 DNAT 规则造成难以排查的行为。
+    if grep -Fqx "${proto}|${listen_port}|${host}|${target_port}" <(cut -d'|' -f2- "$CONFIG") 2>/dev/null; then
+        echo -e "${YELLOW}完全相同的规则已经存在，未重复添加${NC}"
+        return
+    fi
 
     id="$(next_id)"
     echo "${id}|${proto}|${listen_port}|${host}|${target_port}" >> "$CONFIG"
@@ -425,7 +716,6 @@ add_rule() {
     echo
     echo -e "${GREEN}添加成功${NC}"
     echo "ID: $id"
-    echo "$proto :$listen_port -> $host ($ip):$target_port"
 
     reload_rules
 }
@@ -482,7 +772,12 @@ delete_rule() {
 
 show_nft() {
     echo
-    nft list table ip "$TABLE" 2>/dev/null || echo "当前还没有 nft 规则"
+    echo "===== IPv4 ====="
+    nft list table ip "$TABLE" 2>/dev/null || echo "当前没有 IPv4 nft 转发规则"
+
+    echo
+    echo "===== IPv6 ====="
+    nft list table ip6 "$TABLE6" 2>/dev/null || echo "当前没有 IPv6 nft 转发规则"
 }
 
 get_crontab() {
