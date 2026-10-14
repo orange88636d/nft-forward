@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-APP_VERSION="2.3.0"
+APP_VERSION="2.4.0"
 
 CONFIG="/etc/nft-forward.conf"
 STATE_DIR="/var/lib/nft-forward"
@@ -19,6 +19,18 @@ TABLE4="nft_forward"
 TABLE6="nft_forward6"
 MAP_TCP="tcp_map"
 MAP_UDP="udp_map"
+
+# 转发计数采用独立的 inet/filter 表，在 forward hook 统计双向流量。
+# 独立于 nat 表，避免 DNS map 增量刷新时丢失数据。
+METER_TABLE="nft_forward_meter"
+TRAFFIC_SNAPSHOT="$STATE_DIR/traffic.tsv"
+QUOTA_LIMIT_FILE="$STATE_DIR/quota_limit_bytes"
+QUOTA_USED_FILE="$STATE_DIR/quota_used_bytes"
+PAUSED_FILE="$STATE_DIR/paused"
+QUOTA_SERVICE="/etc/systemd/system/nft-forward-quota.service"
+QUOTA_TIMER="/etc/systemd/system/nft-forward-quota.timer"
+CRON_QUOTA_BEGIN="# BEGIN NFT-FORWARD-QUOTA"
+CRON_QUOTA_END="# END NFT-FORWARD-QUOTA"
 
 INSTALL_PATH="/usr/local/bin/nft-forward"
 
@@ -1035,6 +1047,504 @@ prepare_resolved_rules() {
 }
 
 # ============================================================
+# 双向转发计数 / 系统接口流量 / 转发额度
+# ============================================================
+
+numeric_or_zero() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+quota_limit() {
+    numeric_or_zero "$(cat "$QUOTA_LIMIT_FILE" 2>/dev/null || true)"
+}
+
+quota_used() {
+    numeric_or_zero "$(cat "$QUOTA_USED_FILE" 2>/dev/null || true)"
+}
+
+is_paused() {
+    [ -f "$PAUSED_FILE" ]
+}
+
+human_bytes() {
+    awk -v n="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB PiB", u, " "); i=1;
+        while (n >= 1024 && i < 6) {n=n/1024; i++}
+        printf "%.2f %s", n, u[i]
+    }'
+}
+
+# 接受 500M / 1.5G / 2T 等容量；省略单位时按字节。
+parse_quota_size() {
+    local raw="${1^^}"
+    [[ "$raw" =~ ^([0-9]+([.][0-9]{1,3})?)([KMGT]?I?B?|)$ ]] || return 1
+    local number="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[3]}" power=0
+    unit="${unit%B}"; unit="${unit%I}"
+    case "$unit" in
+        '' ) power=0 ;;
+        K) power=1 ;;
+        M) power=2 ;;
+        G) power=3 ;;
+        T) power=4 ;;
+        *) return 1 ;;
+    esac
+    awk -v n="$number" -v p="$power" 'BEGIN {
+        for (i=0; i<p; i++) n*=1024;
+        if (n<1 || n>9000000000000000) exit 1;
+        printf "%.0f", n
+    }'
+}
+
+# 输出 id|packets|bytes；只使用 nft 的命名 counter 数据。
+meter_read_counters() {
+    nft -n list counters table inet "$METER_TABLE" 2>/dev/null |
+        awk '
+        $1=="counter" {name=$2}
+        /packets[[:space:]]+[0-9]+[[:space:]]+bytes[[:space:]]+[0-9]+/ {
+            pkt=""; b="";
+            for(i=1;i<=NF;i++) {
+                if($i=="packets") pkt=$(i+1);
+                if($i=="bytes") b=$(i+1);
+            }
+            if(name=="total") print "0|"pkt"|"b;
+            else if(name ~ /^rule_[0-9]+$/) {
+                sub(/^rule_/, "", name); print name"|"pkt"|"b
+            }
+            name=""
+        }'
+}
+
+# 配额内核对象的 used 字节数（包括达到限额后被丢弃的探测包）。
+meter_read_quota_used() {
+    nft -n list quota inet "$METER_TABLE" cap 2>/dev/null |
+        awk '
+        $1=="quota" && $2=="cap" {seen=1}
+        seen && /used[[:space:]]+[0-9]+/ {
+            for(i=1;i<=NF;i++) if($i=="used") {print $(i+1); exit}
+        }'
+}
+
+# 读取快照必须先获得原始数值，不能在 nft 查询出错时覆盖旧快照。
+meter_capture() {
+    local tmp data used
+    nft list table inet "$METER_TABLE" >/dev/null 2>&1 || return 0
+    data="$(meter_read_counters)"
+    if [ -n "$data" ] && printf '%s\n' "$data" | grep -q '^0|'; then
+        tmp="$(mktemp "$STATE_DIR/.traffic.XXXXXX")" || return 1
+        printf '%s\n' "$data" > "$tmp"
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$TRAFFIC_SNAPSHOT"
+    fi
+    if [ "$(quota_limit)" -gt 0 ]; then
+        used="$(meter_read_quota_used)"
+        if [[ "$used" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$used" > "$QUOTA_USED_FILE"
+            chmod 600 "$QUOTA_USED_FILE"
+        fi
+    fi
+}
+
+meter_counter_record() {
+    local wanted="$1"
+    [ -r "$TRAFFIC_SNAPSHOT" ] || return 0
+    awk -F'|' -v wanted="$wanted" '$1==wanted {print $2"|"$3; exit}' \
+        "$TRAFFIC_SNAPSHOT" 2>/dev/null
+}
+
+# 在既有 nft transaction 后追加计数和配额表，和转发规则同时提交。
+# 每次重建从快照初始化命名 counter，避免系统更新/重建后流量清零。
+meter_append_ruleset() {
+    local resolved="$1" file="$2"
+    local id proto listen_port host target_port family ip old counters packets bytes
+    local limit used action proto_one
+    limit="$(quota_limit)"
+    used="$(quota_used)"
+    if [ "$limit" -gt 0 ] && [ "$used" -gt "$limit" ]; then used="$limit"; fi
+
+    nft list table inet "$METER_TABLE" >/dev/null 2>&1 &&
+        printf 'delete table inet %s\n' "$METER_TABLE" >> "$file"
+    printf 'add table inet %s\n' "$METER_TABLE" >> "$file"
+    printf 'add chain inet %s forward { type filter hook forward priority -50; policy accept; }\n' "$METER_TABLE" >> "$file"
+
+    counters="$(meter_counter_record 0)"
+    IFS='|' read -r packets bytes <<< "$counters"
+    packets="$(numeric_or_zero "$packets")"
+    bytes="$(numeric_or_zero "$bytes")"
+    printf 'add counter inet %s total { packets %s bytes %s; }\n' \
+        "$METER_TABLE" "$packets" "$bytes" >> "$file"
+
+    if [ "$limit" -gt 0 ]; then
+        printf 'add quota inet %s cap { over %s bytes used %s bytes; }\n' \
+            "$METER_TABLE" "$limit" "$used" >> "$file"
+    fi
+
+    while IFS='|' read -r id proto listen_port host target_port family ip; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        counters="$(meter_counter_record "$id")"
+        IFS='|' read -r packets bytes <<< "$counters"
+        packets="$(numeric_or_zero "$packets")"
+        bytes="$(numeric_or_zero "$bytes")"
+        printf 'add counter inet %s rule_%s { packets %s bytes %s; }\n' \
+            "$METER_TABLE" "$id" "$packets" "$bytes" >> "$file"
+
+        # ct original proto-dst 与 ct status dnat 同时成立时，
+        # forward 链中原始/回复方向都按所属转发端口计数。
+        for proto_one in tcp udp; do
+            case "$proto:$proto_one" in
+                tcp:udp|udp:tcp) continue ;;
+            esac
+            if is_paused; then
+                printf 'add rule inet %s forward ct status dnat meta l4proto %s ct original proto-dst %s drop\n' \
+                    "$METER_TABLE" "$proto_one" "$listen_port" >> "$file"
+                continue
+            fi
+            if [ "$limit" -gt 0 ]; then
+                # 独立的 quota 规则先拦截；未达到配额才匹配后续 counter 规则。
+                printf 'add rule inet %s forward ct status dnat meta l4proto %s ct original proto-dst %s quota name "cap" drop\n' \
+                    "$METER_TABLE" "$proto_one" "$listen_port" >> "$file"
+            fi
+            printf 'add rule inet %s forward ct status dnat meta l4proto %s ct original proto-dst %s counter name "rule_%s" counter name "total"\n' \
+                "$METER_TABLE" "$proto_one" "$listen_port" "$id" >> "$file"
+        done
+    done < "$resolved"
+}
+
+# STATE_FILE 的字段顺序和完整 resolved 不一样。
+meter_resolved_from_state() {
+    awk -F'|' 'NF>=7 {printf "%s|%s|%s|%s|%s|%s|%s\n", $1,$5,$6,$2,$7,$3,$4}' \
+        "$STATE_FILE" > "$1"
+}
+
+# 不改 NAT，只更新计数表（改变限额、初次升级启用统计时使用）。
+meter_rebuild_only() {
+    local resolved tx
+    resolved="$(mktemp)"; tx="$(mktemp)"
+    meter_resolved_from_state "$resolved"
+    : > "$tx"
+    meter_append_ruleset "$resolved" "$tx"
+    if ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
+        rm -f "$resolved" "$tx"
+        log_msg "meter rebuild failed"
+        return 1
+    fi
+    rm -f "$resolved" "$tx"
+}
+
+# 提前存下内核计数，写暂停标记后原子移除 NAT 并改成 drop 规则。
+pause_forwarding() {
+    local reason="${1:-manual}" resolved tx
+    lock_begin || return 1
+    meter_capture
+    touch "$PAUSED_FILE"
+    printf '%s\n' "$reason" > "$PAUSED_FILE"
+    resolved="$(mktemp)"; tx="$(mktemp)"
+    meter_resolved_from_state "$resolved"
+    : > "$tx"
+    append_delete_existing_tables "$tx"
+    meter_append_ruleset "$resolved" "$tx"
+    if ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
+        echo -e "${RED}停转发失败，请检查 nftables；内核配额仍尝试阻止超额流量${NC}" >&2
+        log_msg "pause forwarding failed reason=$reason"
+        # 若暂停重建语法失败，尽量先移除本程序的 NAT 表（独立事务）。
+        nft delete table ip "$TABLE4" >/dev/null 2>&1 || true
+        nft delete table ip6 "$TABLE6" >/dev/null 2>&1 || true
+        rm -f "$resolved" "$tx"
+        lock_end
+        return 1
+    fi
+    log_msg "forwarding paused reason=$reason"
+    rm -f "$resolved" "$tx"
+    lock_end
+    echo -e "${YELLOW}转发已暂停（配置仍保留），原因: $reason${NC}"
+}
+
+resume_forwarding() {
+    local limit
+    lock_begin || return 1
+    meter_capture
+    limit="$(quota_limit)"
+    # 新周期从 0 开始计算额度；历史总流量不会清零。
+    printf '0\n' > "$QUOTA_USED_FILE"
+    rm -f "$PAUSED_FILE"
+    if ! full_rebuild 0 1; then
+        touch "$PAUSED_FILE"
+        echo -e "${RED}恢复失败，仍保持暂停${NC}" >&2
+        lock_end
+        return 1
+    fi
+    lock_end
+    log_msg "forwarding resumed reset_quota=1 limit=$limit"
+    echo -e "${GREEN}转发已恢复，额度周期重新开始，历史统计保留${NC}"
+}
+
+quota_watchdog_install() {
+    local tmp
+    install_current_script || return 1
+    if has_systemd; then
+        cat > "$QUOTA_SERVICE" <<EOF
+[Unit]
+Description=Check nft-forward traffic quota
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH --quota-check
+EOF
+        cat > "$QUOTA_TIMER" <<EOF
+[Unit]
+Description=Check nft-forward traffic quota every 10 seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=nft-forward-quota.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now nft-forward-quota.timer >/dev/null 2>&1 || return 1
+        return 0
+    fi
+    command -v crontab >/dev/null 2>&1 || return 1
+    ensure_cron_service
+    remove_cron_block "$CRON_QUOTA_BEGIN" "$CRON_QUOTA_END"
+    tmp="$(mktemp)"
+    get_crontab > "$tmp"
+    printf '%s\n* * * * * %s --quota-check >/dev/null 2>&1\n%s\n' \
+        "$CRON_QUOTA_BEGIN" "$INSTALL_PATH" "$CRON_QUOTA_END" >> "$tmp"
+    if ! crontab "$tmp"; then rm -f "$tmp"; return 1; fi
+    rm -f "$tmp"
+}
+
+quota_watchdog_disable() {
+    if has_systemd; then
+        systemctl disable --now nft-forward-quota.timer >/dev/null 2>&1 || true
+        rm -f "$QUOTA_TIMER" "$QUOTA_SERVICE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if command -v crontab >/dev/null 2>&1 &&
+       get_crontab | grep -qF "$CRON_QUOTA_BEGIN"; then
+        remove_cron_block "$CRON_QUOTA_BEGIN" "$CRON_QUOTA_END" || true
+    fi
+}
+
+quota_check() {
+    local limit used
+    limit="$(quota_limit)"
+    lock_begin || return 1
+    if [ "$limit" -eq 0 ]; then
+        meter_capture
+        lock_end
+        return 0
+    fi
+    if is_paused; then
+        meter_capture
+        lock_end
+        return 0
+    fi
+    # 监控任务先保存快照；同时检查 nft 配额对象是否存在。
+    if ! nft list quota inet "$METER_TABLE" cap >/dev/null 2>&1; then
+        # 启动过程中 NAT 尚未加载时等待 restore 创建原子 ruleset。
+        if nft list table ip "$TABLE4" >/dev/null 2>&1 ||
+           nft list table ip6 "$TABLE6" >/dev/null 2>&1; then
+            lock_end
+            pause_forwarding "配额防护规则丢失（故障保护）"
+            return $?
+        fi
+        lock_end
+        return 0
+    fi
+    meter_capture
+    used="$(meter_read_quota_used)"
+    if ! [[ "$used" =~ ^[0-9]+$ ]]; then
+        lock_end
+        pause_forwarding "配额内核读数异常（故障保护）"
+        return $?
+    fi
+    if [ "$used" -ge "$limit" ]; then
+        lock_end
+        pause_forwarding "流量达到额度 $(human_bytes "$limit")"
+        return $?
+    fi
+    lock_end
+}
+
+# 只读取内核网卡收发字节：开机以来累积值，不等同于 VPS 计费值。
+system_traffic_view() {
+    local path iface rx tx defiface sumrx=0 sumtx=0
+    defiface="$(ip -4 route show default 2>/dev/null |
+        awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+    echo
+    echo "===== 系统网卡流量（本次开机以来） ====="
+    echo "默认 IPv4 出口网卡: ${defiface:--}"
+    printf '%-17s %17s %17s\n' "设备" "接收 RX" "发送 TX"
+    for path in /sys/class/net/*; do
+        [ -d "$path" ] || continue
+        iface="${path##*/}"
+        [ "$iface" = "lo" ] && continue
+        [ -r "$path/statistics/rx_bytes" ] || continue
+        rx="$(cat "$path/statistics/rx_bytes")"
+        tx="$(cat "$path/statistics/tx_bytes")"
+        printf '%-17s %17s %17s\n' "$iface" \
+            "$(human_bytes "$rx")" "$(human_bytes "$tx")"
+        if [ "$iface" = "$defiface" ]; then
+            sumrx="$rx"; sumtx="$tx"
+        fi
+    done
+    if [ -n "$defiface" ]; then
+        echo "出口网卡收+发: $(human_bytes "$((sumrx + sumtx))")"
+    fi
+    echo "说明：包含本机业务与转发流量；虚拟接口可能重复计数。"
+}
+
+forward_traffic_view() {
+    local id proto port host target_port numbers packets bytes total limit used
+    meter_capture
+    echo
+    echo "===== 转发流量（nft forward 链，双向合计） ====="
+    if ! nft list table inet "$METER_TABLE" >/dev/null 2>&1; then
+        echo "尚未启用内核计数表；请先建立或恢复转发规则。"
+    fi
+    numbers="$(meter_counter_record 0)"
+    IFS='|' read -r packets total <<< "$numbers"
+    total="$(numeric_or_zero "$total")"
+    echo "转发累计: $(human_bytes "$total")（$total 字节）"
+    printf '%-6s %-8s %-9s %16s %s\n' "ID" "协议" "端口" "双向转发" "目标"
+    while IFS='|' read -r id proto port host target_port; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        numbers="$(meter_counter_record "$id")"
+        IFS='|' read -r packets bytes <<< "$numbers"
+        printf '%-6s %-8s %-9s %16s %s:%s\n' "$id" "$proto" "$port" \
+            "$(human_bytes "$(numeric_or_zero "$bytes")")" "$host" "$target_port"
+    done < "$CONFIG"
+    limit="$(quota_limit)"; used="$(quota_used)"
+    if [ "$limit" -gt 0 ]; then
+        echo "额度设置: $(human_bytes "$limit")"
+        echo "额度消耗: $(human_bytes "$used")（含阈值后的丢弃尝试流量）"
+        if [ "$used" -ge "$limit" ]; then echo "额度状态: 已到达"; fi
+    else
+        echo "额度设置: 未启用"
+    fi
+    if is_paused; then
+        echo "转发状态: 已暂停（$(cat "$PAUSED_FILE")）"
+    else
+        echo "转发状态: 未暂停"
+    fi
+    echo "注意：只统计通过 FORWARD 链的 DNAT 流量；本机 OUTPUT DNAT 不计入。"
+}
+
+traffic_menu() {
+    local choice
+    while true; do
+        echo
+        echo "========= 流量统计 ========="
+        echo "1. 查看系统网卡流量"
+        echo "2. 查看转发流量（分规则）"
+        echo "3. 查看全部"
+        echo "0. 返回"
+        read -rp "请选择: " choice
+        case "$choice" in
+            1) system_traffic_view ;;
+            2) forward_traffic_view ;;
+            3) system_traffic_view; forward_traffic_view ;;
+            0) return ;;
+            *) echo "输入错误"; continue ;;
+        esac
+        read -rp "回车继续..."
+    done
+}
+
+set_quota_interactive() {
+    local size bytes oldlimit oldused
+    echo "当前额度: $(human_bytes "$(quota_limit)")（0 表示未设置）"
+    read -rp "请输入新的总转发额度（如 500M、1.5G、100G）: " size
+    if ! bytes="$(parse_quota_size "$size")"; then
+        echo -e "${RED}额度格式不正确${NC}"; return 1
+    fi
+    lock_begin || return 1
+    meter_capture
+    oldlimit="$(quota_limit)"; oldused="$(quota_used)"
+    printf '%s\n' "$bytes" > "$QUOTA_LIMIT_FILE"
+    printf '0\n' > "$QUOTA_USED_FILE"
+    # 暂停时只改变额度，不能绕过手动恢复。
+    if ! meter_rebuild_only; then
+        printf '%s\n' "$oldlimit" > "$QUOTA_LIMIT_FILE"
+        printf '%s\n' "$oldused" > "$QUOTA_USED_FILE"
+        lock_end
+        echo -e "${RED}内核额度设置失败，已恢复旧配置${NC}"
+        return 1
+    fi
+    lock_end
+    if ! quota_watchdog_install; then
+        # 没有监控调度器，必须回滚额度，避免以为有自动停转发。
+        lock_begin || return 1
+        printf '%s\n' "$oldlimit" > "$QUOTA_LIMIT_FILE"
+        printf '%s\n' "$oldused" > "$QUOTA_USED_FILE"
+        meter_rebuild_only || true
+        lock_end
+        echo -e "${RED}无法启用后台额度检查，已回滚。${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}额度已设置为 $(human_bytes "$bytes")，从现在开始计数${NC}"
+    echo "达到额度时 nftables 立即丢弃超额包；后台任务将移除 NAT 转发映射。"
+    log_msg "quota enabled bytes=$bytes"
+}
+
+disable_quota_interactive() {
+    local oldlimit oldused
+    lock_begin || return 1
+    meter_capture
+    oldlimit="$(quota_limit)"; oldused="$(quota_used)"
+    printf '0\n' > "$QUOTA_LIMIT_FILE"
+    printf '0\n' > "$QUOTA_USED_FILE"
+    if ! meter_rebuild_only; then
+        printf '%s\n' "$oldlimit" > "$QUOTA_LIMIT_FILE"
+        printf '%s\n' "$oldused" > "$QUOTA_USED_FILE"
+        lock_end
+        echo -e "${RED}关闭额度失败${NC}"
+        return 1
+    fi
+    lock_end
+    echo "已关闭额度限制。后台快照任务仍保留，用于保存流量统计。"
+    echo "当前处于暂停时仍需要手动恢复转发。"
+    log_msg "quota disabled"
+}
+
+quota_menu() {
+    local choice confirm
+    while true; do
+        echo
+        echo "======= 转发流量自动停止 ======="
+        if is_paused; then echo "状态: 已暂停"; else echo "状态: 正常"; fi
+        echo "当前额度: $(human_bytes "$(quota_limit)")（0 为无限制）"
+        echo "额度计数: $(human_bytes "$(quota_used)")"
+        echo "1. 设置/重新设置额度"
+        echo "2. 取消额度限制"
+        echo "3. 立即暂停全部转发"
+        echo "4. 重新开始额度周期并恢复转发"
+        echo "0. 返回"
+        read -rp "请选择: " choice
+        case "$choice" in
+            1) set_quota_interactive ;;
+            2) disable_quota_interactive ;;
+            3) pause_forwarding "手动暂停" ;;
+            4)
+                read -rp "确认恢复转发并重置本次额度？输入 yes: " confirm
+                [ "$confirm" = yes ] && resume_forwarding || echo "已取消"
+                ;;
+            0) return ;;
+            *) echo "输入错误"; continue ;;
+        esac
+        read -rp "回车继续..."
+    done
+}
+
+# ============================================================
 # nftables 规则生成 / 原子应用
 # ============================================================
 
@@ -1046,6 +1556,7 @@ append_delete_existing_tables() {
 
     nft list table ip6 "$TABLE6" >/dev/null 2>&1 &&
         echo "delete table ip6 $TABLE6" >> "$file"
+    return 0
 }
 
 generate_map_ruleset() {
@@ -1214,8 +1725,13 @@ EOF
 
 full_rebuild() {
     local verbose="${1:-1}"
+    local skip_capture="${2:-0}"
     local resolved new_state nftfile mode
 
+    if is_paused; then
+        [ "$verbose" -eq 0 ] || echo -e "${YELLOW}转发已暂停，不会重建；请在额度菜单中恢复${NC}"
+        return 0
+    fi
     lock_begin || return 1
 
     resolved="$(mktemp)"
@@ -1236,11 +1752,15 @@ full_rebuild() {
         return 1
     fi
 
+    # DNS 查询可能耗时，待解析完再取快照可减少重建时遗漏的数据。
+    if [ "$skip_capture" -eq 0 ]; then meter_capture; fi
     generate_map_ruleset "$resolved" "$nftfile"
+    meter_append_ruleset "$resolved" "$nftfile"
 
     if ! nft -c -f "$nftfile" >/dev/null 2>&1; then
         mode="legacy"
         generate_legacy_ruleset "$resolved" "$nftfile"
+        meter_append_ruleset "$resolved" "$nftfile"
 
         if ! nft -c -f "$nftfile" >/dev/null 2>&1; then
             [ "$verbose" -eq 0 ] ||
@@ -1380,6 +1900,10 @@ append_map_add() {
 }
 
 refresh_dns() {
+    if is_paused; then
+        [ "${1:-1}" -eq 0 ] || echo "额度或手动暂停中，跳过 DNS 刷新"
+        return 0
+    fi
     local verbose="${1:-1}"
     local mode batch state_tmp
     local id proto listen_port host target_port rc
@@ -1389,6 +1913,18 @@ refresh_dns() {
     local need_rebuild=0
 
     lock_begin || return 1
+    if [ "$(quota_limit)" -gt 0 ] &&
+       ! nft list quota inet "$METER_TABLE" cap >/dev/null 2>&1; then
+        lock_end
+        pause_forwarding "DNS 刷新检测到额度防护规则缺失"
+        return 1
+    fi
+    meter_capture
+    if [ "$(quota_limit)" -gt 0 ] && [ "$(quota_used)" -ge "$(quota_limit)" ]; then
+        lock_end
+        pause_forwarding "刷新前检测到额度已满"
+        return 0
+    fi
 
     validate_config_structure || {
         lock_end
@@ -1703,6 +2239,7 @@ add_rule() {
 
         echo
         echo -e "${GREEN}添加成功${NC}"
+        quota_watchdog_install || echo -e "${YELLOW}流量定时快照任务未启用，请使用菜单 9 安装${NC}"
         echo "ID: $id"
         echo "$proto :$listen_port -> $host:$target_port"
         return
@@ -2321,6 +2858,10 @@ install_or_update() {
     echo "日志: $LOG_FILE"
     echo "备份: $BACKUP_DIR"
     echo "日志轮转: $LOGROTATE_FILE"
+    if [ -s "$CONFIG" ]; then
+        ensure_runtime_rules || echo -e "${YELLOW}注意：内核流量表未成功初始化，请检查 nftables${NC}"
+    fi
+    quota_watchdog_install || echo -e "${YELLOW}提示：流量快照/额度定时任务启用失败${NC}"
 }
 
 show_recent_log() {
@@ -2349,6 +2890,12 @@ uninstall_script() {
         return
     }
 
+    # 卸载前先停止程序自己的 NAT 映射，避免留下没有监控的无限制转发。
+    pause_forwarding "卸载程序" || {
+        echo -e "${RED}无法安全关闭正在运行的转发，取消卸载${NC}"
+        return 1
+    }
+    quota_watchdog_disable
     disable_refresh_schedule >/dev/null 2>&1 || true
     disable_boot_restore >/dev/null 2>&1 || true
 
@@ -2474,7 +3021,9 @@ status_overview() {
         echo -e "一致性:             ${YELLOW}配置与状态缓存数量不一致${NC}"
     fi
 
-    if [ "$config_count" -gt 0 ] &&
+    if is_paused; then
+        echo -e "运行状态:           ${YELLOW}已暂停（不会自动恢复）${NC}"
+    elif [ "$config_count" -gt 0 ] &&
        [ "$IPV4_TABLE_STATE" = "未加载" ] &&
        [ "$IPV6_TABLE_STATE" = "未加载" ]; then
 
@@ -2495,10 +3044,11 @@ menu_status_line() {
     refresh_schedule_state
     boot_restore_state
 
-    printf "规则:%s | 定时解析:%s | 开机恢复:%s\n" \
+    printf "规则:%s | 定时解析:%s | 开机恢复:%s | 转发:%s\n" \
         "$config_count" \
         "$REFRESH_STATE" \
-        "$BOOT_STATE"
+        "$BOOT_STATE" \
+        "$(if is_paused; then echo 暂停; else echo 正常; fi)"
 }
 
 # ============================================================
@@ -2506,6 +3056,13 @@ menu_status_line() {
 # ============================================================
 
 ensure_runtime_rules() {
+    if is_paused; then
+        if nft list table ip "$TABLE4" >/dev/null 2>&1 ||
+           nft list table ip6 "$TABLE6" >/dev/null 2>&1; then
+            pause_forwarding "再次确保暂停状态" || return 1
+        fi
+        return 0
+    fi
     if [ ! -s "$CONFIG" ]; then
         return 0
     fi
@@ -2514,7 +3071,14 @@ ensure_runtime_rules() {
        ! tables_present_for_state; then
 
         echo -e "${YELLOW}检测到内核规则未恢复，正在从配置恢复...${NC}"
-        full_rebuild 1
+        full_rebuild 1 || return 1
+    fi
+    if ! nft list table inet "$METER_TABLE" >/dev/null 2>&1; then
+        lock_begin || return 1
+        meter_rebuild_only
+        local meter_rc=$?
+        lock_end
+        [ "$meter_rc" -eq 0 ] || return "$meter_rc"
     fi
 }
 
@@ -2541,6 +3105,8 @@ main_menu() {
         echo "10. 查看最近日志"
         echo "11. 卸载脚本"
         echo "12. 当前状态概览"
+        echo "13. 流量统计（系统/转发）"
+        echo "14. 转发流量额度/自动停止"
         echo "0. 退出"
         echo "================================="
 
@@ -2593,6 +3159,8 @@ main_menu() {
                 status_overview
                 read -rp "回车继续..."
                 ;;
+            13) traffic_menu ;;
+            14) quota_menu ;;
             0)
                 exit 0
                 ;;
@@ -2636,15 +3204,38 @@ main() {
                 exit 1
             }
             ;;
+        --quota-check|--traffic|--pause|--resume)
+            [ "$(id -u)" -eq 0 ] && command -v nft >/dev/null 2>&1 ||
+                die "必须使用 root，且需要 nft 命令"
+            ;;
         *)
             preflight_check
             ;;
     esac
 
     ensure_data_files
-    enable_forwarding
+    case "$action" in
+        --refresh|--restore|--install|'') enable_forwarding ;;
+    esac
 
     case "$action" in
+        --quota-check)
+            quota_check
+            exit $?
+            ;;
+        --traffic)
+            system_traffic_view
+            forward_traffic_view
+            exit 0
+            ;;
+        --pause)
+            pause_forwarding "命令行手动暂停"
+            exit $?
+            ;;
+        --resume)
+            resume_forwarding
+            exit $?
+            ;;
         --refresh)
             refresh_dns 0
             exit $?
@@ -2671,6 +3262,10 @@ main() {
             echo "  $0 --install"
             echo "  $0 --uninstall"
             echo "  $0 --version"
+            echo "  $0 --traffic"
+            echo "  $0 --quota-check"
+            echo "  $0 --pause"
+            echo "  $0 --resume"
             exit 1
             ;;
     esac
