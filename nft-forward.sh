@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-APP_VERSION="2.4.0"
+APP_VERSION="2.5.0"
 
 CONFIG="/etc/nft-forward.conf"
 STATE_DIR="/var/lib/nft-forward"
@@ -26,6 +26,8 @@ METER_TABLE="nft_forward_meter"
 TRAFFIC_SNAPSHOT="$STATE_DIR/traffic.tsv"
 QUOTA_LIMIT_FILE="$STATE_DIR/quota_limit_bytes"
 QUOTA_USED_FILE="$STATE_DIR/quota_used_bytes"
+QUOTA_MODE_FILE="$STATE_DIR/quota_mode"
+WAN_IFACE_FILE="$STATE_DIR/wan_iface"
 PAUSED_FILE="$STATE_DIR/paused"
 QUOTA_SERVICE="/etc/systemd/system/nft-forward-quota.service"
 QUOTA_TIMER="/etc/systemd/system/nft-forward-quota.timer"
@@ -1065,6 +1067,40 @@ quota_used() {
     numeric_or_zero "$(cat "$QUOTA_USED_FILE" 2>/dev/null || true)"
 }
 
+# 升级自 2.4.0 时，默认保持原有双向转发统计额度。
+quota_mode() {
+    case "$(cat "$QUOTA_MODE_FILE" 2>/dev/null || true)" in
+        egress) printf 'egress' ;;
+        *) printf 'forward' ;;
+    esac
+}
+
+quota_mode_label() {
+    case "$(quota_mode)" in
+        egress) printf '公网出口网卡 TX（仅计发送）' ;;
+        *) printf '转发双向（上传+下载）' ;;
+    esac
+}
+
+# 优先使用固定网卡，缺省为系统默认 IPv4 路由的接口。
+# 固定的网卡名不会随 DNS 刷新或重启悄悄改变。
+wan_interface() {
+    local iface
+    iface="$(cat "$WAN_IFACE_FILE" 2>/dev/null || true)"
+    if [ -z "$iface" ]; then
+        iface="$(ip -4 route show default 2>/dev/null |
+            awk 'NR==1{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+    fi
+    printf '%s' "$iface"
+}
+
+valid_wan_interface() {
+    local iface="$1"
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || return 1
+    [ "$iface" != lo ] || return 1
+    ip link show dev "$iface" >/dev/null 2>&1
+}
+
 is_paused() {
     [ -f "$PAUSED_FILE" ]
 }
@@ -1110,6 +1146,7 @@ meter_read_counters() {
                 if($i=="bytes") b=$(i+1);
             }
             if(name=="total") print "0|"pkt"|"b;
+            else if(name=="wan_tx") print "WAN|"pkt"|"b;
             else if(name ~ /^rule_[0-9]+$/) {
                 sub(/^rule_/, "", name); print name"|"pkt"|"b
             }
@@ -1159,9 +1196,18 @@ meter_counter_record() {
 meter_append_ruleset() {
     local resolved="$1" file="$2"
     local id proto listen_port host target_port family ip old counters packets bytes
-    local limit used action proto_one
+    local limit used action proto_one qmode wan
     limit="$(quota_limit)"
     used="$(quota_used)"
+    qmode="$(quota_mode)"
+    wan="$(wan_interface)"
+    # 公网出站限额必须绑定明确存在的出口网卡，避免静默失去防护。
+    if [ "$qmode" = egress ] && ! is_paused; then
+        valid_wan_interface "$wan" || {
+            echo "公网出口网卡无效：${wan:-未识别}；拒绝加载不受保护的转发规则" >&2
+            return 1
+        }
+    fi
     if [ "$limit" -gt 0 ] && [ "$used" -gt "$limit" ]; then used="$limit"; fi
 
     nft list table inet "$METER_TABLE" >/dev/null 2>&1 &&
@@ -1179,6 +1225,27 @@ meter_append_ruleset() {
     if [ "$limit" -gt 0 ]; then
         printf 'add quota inet %s cap { over %s bytes used %s bytes; }\n' \
             "$METER_TABLE" "$limit" "$used" >> "$file"
+    fi
+
+    # 公网出口 TX 统计采用 postrouting，IPv4/IPv6 都会在出接口时计一次。
+    # 不对所有公网出口包直接 drop，否则 SSH 回包也会被阻断。
+    if [ -n "$wan" ] && [[ "$wan" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]]; then
+        counters="$(meter_counter_record WAN)"
+        IFS='|' read -r packets bytes <<< "$counters"
+        printf 'add chain inet %s postrouting { type filter hook postrouting priority 150; policy accept; }\n' "$METER_TABLE" >> "$file"
+        printf 'add counter inet %s wan_tx { packets %s bytes %s; }\n' \
+            "$METER_TABLE" "$(numeric_or_zero "$packets")" "$(numeric_or_zero "$bytes")" >> "$file"
+        if [ "$qmode" = egress ] && [ "$limit" -gt 0 ] && ! is_paused; then
+            # 所有经 WAN 出口的包都消耗额度；超额时跳到本程序专用拦截链。
+            # 限额的求值每包只执行一次，之后只拦截本程序的 DNAT 端口。
+            # 其他本机服务（含 SSH）和不相关 DNAT 不会因此被直接丢弃。
+            printf 'add chain inet %s egress_block\n' "$METER_TABLE" >> "$file"
+            printf 'add rule inet %s postrouting oifname "%s" quota name "cap" jump egress_block\n' \
+                "$METER_TABLE" "$wan" >> "$file"
+        fi
+        # 位于 jump 规则后：只统计允许离开主机的包，不含此处已丢弃的包。
+        printf 'add rule inet %s postrouting oifname "%s" counter name "wan_tx"\n' \
+            "$METER_TABLE" "$wan" >> "$file"
     fi
 
     while IFS='|' read -r id proto listen_port host target_port family ip; do
@@ -1201,8 +1268,12 @@ meter_append_ruleset() {
                     "$METER_TABLE" "$proto_one" "$listen_port" >> "$file"
                 continue
             fi
-            if [ "$limit" -gt 0 ]; then
-                # 独立的 quota 规则先拦截；未达到配额才匹配后续 counter 规则。
+            if [ "$limit" -gt 0 ] && [ "$qmode" = egress ] && ! is_paused; then
+                printf 'add rule inet %s egress_block ct status dnat meta l4proto %s ct original proto-dst %s drop\n' \
+                    "$METER_TABLE" "$proto_one" "$listen_port" >> "$file"
+            fi
+            if [ "$limit" -gt 0 ] && [ "$qmode" = forward ]; then
+                # 双向转发模式在 forward 钩子执行限额；出站模式在 postrouting 计算。
                 printf 'add rule inet %s forward ct status dnat meta l4proto %s ct original proto-dst %s quota name "cap" drop\n' \
                     "$METER_TABLE" "$proto_one" "$listen_port" >> "$file"
             fi
@@ -1224,8 +1295,8 @@ meter_rebuild_only() {
     resolved="$(mktemp)"; tx="$(mktemp)"
     meter_resolved_from_state "$resolved"
     : > "$tx"
-    meter_append_ruleset "$resolved" "$tx"
-    if ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
+    if ! meter_append_ruleset "$resolved" "$tx" ||
+       ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
         rm -f "$resolved" "$tx"
         log_msg "meter rebuild failed"
         return 1
@@ -1244,8 +1315,8 @@ pause_forwarding() {
     meter_resolved_from_state "$resolved"
     : > "$tx"
     append_delete_existing_tables "$tx"
-    meter_append_ruleset "$resolved" "$tx"
-    if ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
+    if ! meter_append_ruleset "$resolved" "$tx" ||
+       ! nft -c -f "$tx" >/dev/null 2>&1 || ! nft -f "$tx"; then
         echo -e "${RED}停转发失败，请检查 nftables；内核配额仍尝试阻止超额流量${NC}" >&2
         log_msg "pause forwarding failed reason=$reason"
         # 若暂停重建语法失败，尽量先移除本程序的 NAT 表（独立事务）。
@@ -1334,7 +1405,7 @@ quota_watchdog_disable() {
 }
 
 quota_check() {
-    local limit used
+    local limit used qmode wan
     limit="$(quota_limit)"
     lock_begin || return 1
     if [ "$limit" -eq 0 ]; then
@@ -1358,6 +1429,21 @@ quota_check() {
         fi
         lock_end
         return 0
+    fi
+    qmode="$(quota_mode)"
+    if [ "$qmode" = egress ]; then
+        wan="$(wan_interface)"
+        # 仅检查配额对象不够，还要确保出口网卡的限额规则依然存在。
+        if ! valid_wan_interface "$wan" ||
+           ! nft -n list chain inet "$METER_TABLE" postrouting 2>/dev/null |
+                grep -Fq "oifname \"$wan\" quota name \"cap\" jump egress_block" ||
+           { [ -s "$CONFIG" ] &&
+             ! nft -n list chain inet "$METER_TABLE" egress_block 2>/dev/null |
+                  grep -Fq 'drop'; }; then
+            lock_end
+            pause_forwarding "出口限额规则/网卡丢失（故障保护）"
+            return $?
+        fi
     fi
     meter_capture
     used="$(meter_read_quota_used)"
@@ -1422,7 +1508,12 @@ forward_traffic_view() {
         printf '%-6s %-8s %-9s %16s %s:%s\n' "$id" "$proto" "$port" \
             "$(human_bytes "$(numeric_or_zero "$bytes")")" "$host" "$target_port"
     done < "$CONFIG"
+    numbers="$(meter_counter_record WAN)"
+    IFS='|' read -r packets bytes <<< "$numbers"
+    echo "公网出口网卡: $(wan_interface)"
+    echo "公网出口 TX: $(human_bytes "$(numeric_or_zero "$bytes")")（$(numeric_or_zero "$bytes") 字节，自本版本启动统计）"
     limit="$(quota_limit)"; used="$(quota_used)"
+    echo "额度模式: $(quota_mode_label)"
     if [ "$limit" -gt 0 ]; then
         echo "额度设置: $(human_bytes "$limit")"
         echo "额度消耗: $(human_bytes "$used")（含阈值后的丢弃尝试流量）"
@@ -1435,7 +1526,8 @@ forward_traffic_view() {
     else
         echo "转发状态: 未暂停"
     fi
-    echo "注意：只统计通过 FORWARD 链的 DNAT 流量；本机 OUTPUT DNAT 不计入。"
+    echo "说明：双向转发只统计 FORWARD/DNAT；出口 TX 统计所选网卡 postrouting（含本机业务/IPv4/IPv6）。"
+    echo "出口网卡数据不一定等于云服务商计费数据；网卡上的内网流量也可能被计入。"
 }
 
 traffic_menu() {
@@ -1461,8 +1553,13 @@ traffic_menu() {
 
 set_quota_interactive() {
     local size bytes oldlimit oldused
+    echo "当前额度模式: $(quota_mode_label)"
     echo "当前额度: $(human_bytes "$(quota_limit)")（0 表示未设置）"
-    read -rp "请输入新的总转发额度（如 500M、1.5G、100G）: " size
+    if [ "$(quota_mode)" = egress ] && ! valid_wan_interface "$(wan_interface)"; then
+        echo -e "${RED}当前出口网卡无效，请先使用菜单 5 配置网卡${NC}"
+        return 1
+    fi
+    read -rp "请输入新的额度（如 500M、1.5G、100G）: " size
     if ! bytes="$(parse_quota_size "$size")"; then
         echo -e "${RED}额度格式不正确${NC}"; return 1
     fi
@@ -1491,7 +1588,11 @@ set_quota_interactive() {
         return 1
     fi
     echo -e "${GREEN}额度已设置为 $(human_bytes "$bytes")，从现在开始计数${NC}"
-    echo "达到额度时 nftables 立即丢弃超额包；后台任务将移除 NAT 转发映射。"
+    echo "当前模式: $(quota_mode_label)"
+    echo "达到额度后，仅阻断 DNAT 转发包；后台任务移除 NAT 转发映射。"
+    if [ "$(quota_mode)" = egress ]; then
+        echo "本机其他出站不会被切断，仍可能产生计费流量。"
+    fi
     log_msg "quota enabled bytes=$bytes"
 }
 
@@ -1515,23 +1616,78 @@ disable_quota_interactive() {
     log_msg "quota disabled"
 }
 
+set_quota_mode_interactive() {
+    local selected newmode newwan proposed oldmode oldwan oldused
+    echo "当前额度模式: $(quota_mode_label)"
+    echo "1. 双向转发流量（仅 DNAT 转发，上传+下载）"
+    echo "2. 公网出口网卡 TX（本机+转发的出站，按网卡发送字节）"
+    read -rp "请选择模式 [1/2]: " selected
+    case "$selected" in
+        1) newmode=forward; newwan="$(cat "$WAN_IFACE_FILE" 2>/dev/null || true)" ;;
+        2)
+            newmode=egress
+            proposed="$(wan_interface)"
+            echo "检测到出口网卡: ${proposed:--}"
+            read -rp "请输入出口网卡（回车使用上述网卡）: " newwan
+            newwan="${newwan:-$proposed}"
+            if ! valid_wan_interface "$newwan"; then
+                echo -e "${RED}出口网卡无效，请通过 ip -br link 确认名称${NC}"
+                return 1
+            fi
+            echo "提示：这里监控的是 $newwan 的全部 TX，不等于阿里云 CDT 的精确计费口径。"
+            ;;
+        *) echo "已取消"; return 0 ;;
+    esac
+    echo "切换模式将重置本次额度消耗，不会清空历史流量。"
+    read -rp "确认请输入 yes: " selected
+    [ "$selected" = yes ] || { echo "已取消"; return 0; }
+    lock_begin || return 1
+    meter_capture
+    oldmode="$(quota_mode)"
+    oldwan="$(cat "$WAN_IFACE_FILE" 2>/dev/null || true)"
+    oldused="$(quota_used)"
+    printf '%s\n' "$newmode" > "$QUOTA_MODE_FILE"
+    if [ "$newmode" = egress ]; then
+        printf '%s\n' "$newwan" > "$WAN_IFACE_FILE"
+    fi
+    printf '0\n' > "$QUOTA_USED_FILE"
+    if ! meter_rebuild_only; then
+        printf '%s\n' "$oldmode" > "$QUOTA_MODE_FILE"
+        printf '%s\n' "$oldwan" > "$WAN_IFACE_FILE"
+        printf '%s\n' "$oldused" > "$QUOTA_USED_FILE"
+        lock_end
+        echo -e "${RED}模式切换失败，旧限额配置已恢复；原 nft 规则未修改${NC}"
+        return 1
+    fi
+    lock_end
+    if [ "$(quota_limit)" -gt 0 ]; then
+        quota_watchdog_install || echo -e "${YELLOW}注意：定时检查未成功启用，请检查 systemd timer${NC}"
+    fi
+    echo -e "${GREEN}当前额度模式: $(quota_mode_label)，本次用量已归零${NC}"
+    log_msg "quota mode changed mode=$newmode wan=$newwan"
+}
+
 quota_menu() {
     local choice confirm
     while true; do
         echo
         echo "======= 转发流量自动停止 ======="
         if is_paused; then echo "状态: 已暂停"; else echo "状态: 正常"; fi
+        echo "额度统计模式: $(quota_mode_label)"
+        [ "$(quota_mode)" = egress ] && echo "计费参考网卡: $(wan_interface)"
         echo "当前额度: $(human_bytes "$(quota_limit)")（0 为无限制）"
         echo "额度计数: $(human_bytes "$(quota_used)")"
         echo "1. 设置/重新设置额度"
         echo "2. 取消额度限制"
         echo "3. 立即暂停全部转发"
         echo "4. 重新开始额度周期并恢复转发"
+        echo "5. 切换额度统计模式（双向转发 / 公网出口 TX）"
         echo "0. 返回"
         read -rp "请选择: " choice
         case "$choice" in
             1) set_quota_interactive ;;
             2) disable_quota_interactive ;;
+            5) set_quota_mode_interactive ;;
             3) pause_forwarding "手动暂停" ;;
             4)
                 read -rp "确认恢复转发并重置本次额度？输入 yes: " confirm
@@ -1755,12 +1911,20 @@ full_rebuild() {
     # DNS 查询可能耗时，待解析完再取快照可减少重建时遗漏的数据。
     if [ "$skip_capture" -eq 0 ]; then meter_capture; fi
     generate_map_ruleset "$resolved" "$nftfile"
-    meter_append_ruleset "$resolved" "$nftfile"
+    if ! meter_append_ruleset "$resolved" "$nftfile"; then
+        rm -f "$resolved" "$new_state" "$nftfile"
+        lock_end
+        return 1
+    fi
 
     if ! nft -c -f "$nftfile" >/dev/null 2>&1; then
         mode="legacy"
         generate_legacy_ruleset "$resolved" "$nftfile"
-        meter_append_ruleset "$resolved" "$nftfile"
+        if ! meter_append_ruleset "$resolved" "$nftfile"; then
+            rm -f "$resolved" "$new_state" "$nftfile"
+            lock_end
+            return 1
+        fi
 
         if ! nft -c -f "$nftfile" >/dev/null 2>&1; then
             [ "$verbose" -eq 0 ] ||
@@ -2861,6 +3025,12 @@ install_or_update() {
     if [ -s "$CONFIG" ]; then
         ensure_runtime_rules || echo -e "${YELLOW}注意：内核流量表未成功初始化，请检查 nftables${NC}"
     fi
+    # 从 2.4.0 升级时旧计数表已存在，主动重建一次才能启用 WAN TX 统计。
+    lock_begin && {
+        meter_capture
+        meter_rebuild_only || echo -e "${YELLOW}新计数表未加载；原转发规则保持不变，请检查 nftables 兼容性${NC}"
+        lock_end
+    }
     quota_watchdog_install || echo -e "${YELLOW}提示：流量快照/额度定时任务启用失败${NC}"
 }
 
@@ -3011,6 +3181,10 @@ status_overview() {
         printf " (%s)" "$BOOT_BACKEND"
     echo
 
+    printf "%-20s %s\n" "额度模式:" "$(quota_mode_label)"
+    [ "$(quota_mode)" = egress ] && printf "%-20s %s\n" "公网出口网卡:" "$(wan_interface)"
+    printf "%-20s %s\n" "额度限额:" "$(human_bytes "$(quota_limit)")"
+    printf "%-20s %s\n" "额度累计:" "$(human_bytes "$(quota_used)")"
     printf "%-20s %s\n" "最后日志时间:" "$lastlog"
     printf "%-20s %s\n" "配置文件:" "$CONFIG"
     printf "%-20s %s\n" "日志文件:" "$LOG_FILE"
@@ -3106,7 +3280,7 @@ main_menu() {
         echo "11. 卸载脚本"
         echo "12. 当前状态概览"
         echo "13. 流量统计（系统/转发）"
-        echo "14. 转发流量额度/自动停止"
+        echo "14. 转发额度/自动停止（双向或公网出口 TX）"
         echo "0. 退出"
         echo "================================="
 
