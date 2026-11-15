@@ -495,15 +495,42 @@ valid_ipv4() {
 }
 
 valid_ipv6() {
-    local ip="$1"
-    local t="__nftfw_validate_${RANDOM}_$$"
+    # IPv6 format validation must not depend on kernel nftables NAT support.
+    local ip="$1" part tail rest n=0 compressed=0
+    local -a segments=()
 
     [[ "$ip" == *:* ]] || return 1
     [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    [[ "$ip" != *:::* ]] || return 1
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
 
-    printf 'table ip6 %s { chain c { type nat hook prerouting priority -100; tcp dport 1 dnat to [%s]:1; } }\n' \
-        "$t" "$ip" |
-        nft -c -f - >/dev/null 2>&1
+    if [[ "$ip" == *::* ]]; then
+        compressed=1
+        rest="${ip/::/}"
+        [[ "$rest" != *::* ]] || return 1
+    fi
+
+    # Embedded IPv4 occupies two 16-bit IPv6 groups.
+    if [[ "$ip" == *.* ]]; then
+        tail="${ip##*:}"
+        valid_ipv4 "$tail" || return 1
+        ip="${ip%:*}:0:0"
+    fi
+
+    IFS=':' read -r -a segments <<< "$ip"
+    for part in "${segments[@]}"; do
+        [[ -z "$part" ]] && continue
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        n=$((n + 1))
+    done
+
+    if (( compressed )); then
+        (( n < 8 )) || return 1
+    else
+        (( n == 8 )) || return 1
+    fi
+    return 0
 }
 
 valid_domain() {
